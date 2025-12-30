@@ -1,4 +1,4 @@
-//! TEST_Multi_layers v9: Order Reconciliation via REST Polling
+//! TEST_Multi_layers v10: Race-Free Order State Machine
 use anyhow::Result;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::connect_async;
-use tracing::info;
+use tracing::{info, warn};
 
 mod exchange;
 use exchange::auth::KucoinAuth;
@@ -43,6 +43,31 @@ const MOMENTUM_THRESHOLD: f64 = 0.003;
 const MOMENTUM_WINDOW_SECS: u64 = 300;
 const ETA: f64 = -0.005;
 
+// V10: Cancel pending timeout - if cancel hasn't resolved in recon, force clear
+const CANCEL_TIMEOUT_SECS: u64 = 5;
+
+// ═══════════════════════════════════════════════════════════════════
+// V10: ORDER STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════
+#[derive(Clone, Debug)]
+enum LevelOrderState {
+    Empty,
+    Live { order_id: String, price: f64 },
+    CancelPending { order_id: String, price: f64, sent_at: Instant },
+}
+
+impl LevelOrderState {
+    fn is_empty(&self) -> bool { matches!(self, LevelOrderState::Empty) }
+    fn is_live(&self) -> bool { matches!(self, LevelOrderState::Live { .. }) }
+    fn order_id(&self) -> Option<&str> {
+        match self {
+            LevelOrderState::Live { order_id, .. } => Some(order_id),
+            LevelOrderState::CancelPending { order_id, .. } => Some(order_id),
+            LevelOrderState::Empty => None,
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // STRUCTS
 // ═══════════════════════════════════════════════════════════════════
@@ -56,6 +81,13 @@ struct ActiveOrder {
 
 #[derive(Default, Clone)]
 struct Balances { sol: f64, usdt: f64 }
+
+// V10: Pending notional tracking
+#[derive(Default, Clone)]
+struct PendingNotional {
+    usdt_committed: f64,
+    sol_committed: f64,
+}
 
 struct Entry { px: f64, sz: f64 }
 #[derive(Default)]
@@ -103,22 +135,40 @@ impl PnL {
 struct MarketData {
     mid: f64, ofi: f64, last_mid: f64, ewma_var: f64,
     price_history: VecDeque<(Instant, f64)>,
+    // V10: Track actual update interval for correct sigma annualization
+    last_update: Option<Instant>,
+    update_interval_ms: f64,
 }
 impl MarketData {
     fn update(&mut self) {
+        let now = Instant::now();
+        
+        // V10: Track actual update interval
+        if let Some(last) = self.last_update {
+            let elapsed_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+            // EWMA of update interval for stable estimate
+            self.update_interval_ms = 0.9 * self.update_interval_ms + 0.1 * elapsed_ms;
+        }
+        self.last_update = Some(now);
+        
         if self.last_mid > 0.0 && self.mid > 0.0 {
             let ret = (self.mid / self.last_mid).ln();
             self.ewma_var = VOL_EWMA_LAMBDA * self.ewma_var + (1.0 - VOL_EWMA_LAMBDA) * ret * ret;
         }
         self.last_mid = self.mid;
-        let now = Instant::now();
         self.price_history.push_back((now, self.mid));
         let cutoff = now - Duration::from_secs(MOMENTUM_WINDOW_SECS);
         while let Some((t, _)) = self.price_history.front() {
             if *t < cutoff { self.price_history.pop_front(); } else { break; }
         }
     }
-    fn sigma(&self) -> f64 { (self.ewma_var * 86400.0 * 365.0).sqrt().max(SIGMA_FLOOR) }
+    fn sigma(&self) -> f64 { 
+        // V10: Correct annualization based on actual update interval
+        // Default to 100ms if not yet calibrated
+        let interval_ms = if self.update_interval_ms > 0.0 { self.update_interval_ms } else { 100.0 };
+        let updates_per_day = 86400.0 * 1000.0 / interval_ms;
+        (self.ewma_var * updates_per_day * 365.0).sqrt().max(SIGMA_FLOOR) 
+    }
     fn momentum(&self) -> f64 {
         if let Some((_, p)) = self.price_history.front() {
             if *p > 0.0 && self.mid > 0.0 { return (self.mid - p) / p; }
@@ -256,10 +306,22 @@ async fn poll_fills(auth: &KucoinAuth, seen: &mut HashSet<String>) -> Vec<(Strin
     out
 }
 
+// V10: REST cancel all orders
+async fn cancel_all_orders(auth: &KucoinAuth) {
+    let ep = "/api/v1/orders";
+    let body = r#"{"symbol":"SOL-USDT"}"#;
+    let (ts, sig, pw, ver) = auth.sign("DELETE", ep, body);
+    let _ = reqwest::Client::new().delete(format!("https://api.kucoin.com{}", ep))
+        .header("KC-API-KEY", auth.api_key()).header("KC-API-SIGN", &sig)
+        .header("KC-API-TIMESTAMP", &ts).header("KC-API-PASSPHRASE", &pw)
+        .header("KC-API-KEY-VERSION", &ver).header("Content-Type", "application/json")
+        .body(body).send().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_target(false).init();
-    info!("═══ v9: Order Reconciliation via REST ═══");
+    info!("═══ v10: Race-Free Order State Machine ═══");
     
     let auth = KucoinAuth::new(
         std::env::var("KUCOIN_API_KEY")?, std::env::var("KUCOIN_API_SECRET")?,
@@ -268,11 +330,19 @@ async fn main() -> Result<()> {
     let auth2 = auth.clone();
     let auth3 = auth.clone();
     let auth4 = auth.clone();
+    let auth_shutdown = auth.clone();
     
-    let ws = Arc::new(RwLock::new(WsOrderClientV2::new(
+    // V10: Remove unnecessary RwLock - WsOrderClientV2 uses internal Arc
+    let ws = Arc::new(WsOrderClientV2::new(
         auth, "https://api.kucoin.com".into(), "wss://wsapi.kucoin.com/v1/private".into()
-    )));
-    { ws.write().await.connect().await?; }
+    ));
+    { 
+        // Note: connect() takes &mut self, we need a workaround
+        // Actually looking at ws_order_client_v2.rs, connect() -> start() which takes &self
+        // The signature is: pub async fn connect(&mut self) -> Result<JoinHandle<()>>
+        // We need to call start() directly which takes &self
+        let _ = ws.start().await?; 
+    }
     info!("[WS] OK");
     
     let data = Arc::new(RwLock::new(MarketData::default()));
@@ -285,14 +355,7 @@ async fn main() -> Result<()> {
     *balances.write().await = bal;
     
     // Cancel all orders on startup
-    let ep = "/api/v1/orders";
-    let body = r#"{"symbol":"SOL-USDT"}"#;
-    let (ts2, sig2, pw2, ver2) = auth3.sign("DELETE", ep, body);
-    let _ = reqwest::Client::new().delete(format!("https://api.kucoin.com{}", ep))
-        .header("KC-API-KEY", auth3.api_key()).header("KC-API-SIGN", &sig2)
-        .header("KC-API-TIMESTAMP", &ts2).header("KC-API-PASSPHRASE", &pw2)
-        .header("KC-API-KEY-VERSION", &ver2).header("Content-Type", "application/json")
-        .body(body).send().await;
+    cancel_all_orders(&auth3).await;
     info!("[STARTUP] Cancelled all existing orders");
     tokio::time::sleep(Duration::from_secs(1)).await;
     let orders = poll_active_orders(&auth3).await;
@@ -305,95 +368,150 @@ async fn main() -> Result<()> {
     loop { if data.read().await.mid > 0.0 { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
     info!("[START] mid={:.2}", data.read().await.mid);
     
-    // Track which levels have orders - key: level_bps, value: (bid_order_id, ask_order_id)
-    let mut level_orders: HashMap<i32, (Option<(String, f64)>, Option<(String, f64)>)> = HashMap::new();
+    // V10: Order state machine per level - key: level_bps*10, value: (bid_state, ask_state)
+    let mut level_orders: HashMap<i32, (LevelOrderState, LevelOrderState)> = HashMap::new();
     for (bps, _) in LEVELS.iter() {
-        level_orders.insert((*bps * 10.0) as i32, (None, None));
+        level_orders.insert((*bps * 10.0) as i32, (LevelOrderState::Empty, LevelOrderState::Empty));
     }
     
     let mut pnl = PnL::default();
     let mut seen: HashSet<String> = HashSet::new();
     let start = Instant::now();
     
-    let mut tick = tokio::time::interval(Duration::from_millis(500)); // Slower tick
+    // V10: Pending notional tracker - reset on each balance poll
+    let mut pending = PendingNotional::default();
+    
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
     let mut log = tokio::time::interval(Duration::from_secs(30));
     let mut fp = tokio::time::interval(Duration::from_secs(5));
-    let mut recon = tokio::time::interval(Duration::from_secs(1)); // Order reconciliation - 1s for strict limit
+    let mut recon = tokio::time::interval(Duration::from_secs(1));
     let mut n: u64 = 0;
     
     let mut ofi_paused = false;
     let mut mom_paused = false;
-    let mut last_mid = 0.0_f64;
+    
+    // V10: Graceful shutdown flag
+    let mut shutting_down = false;
     
     loop {
         tokio::select! {
-            _ = recon.tick() => {
+            // V10: Graceful shutdown on Ctrl+C
+            _ = tokio::signal::ctrl_c(), if !shutting_down => {
+                info!("[SHUTDOWN] Received SIGINT, initiating graceful shutdown...");
+                shutting_down = true;
+                
+                // Stop placing new orders (flag is set)
+                // Cancel all orders via REST
+                cancel_all_orders(&auth_shutdown).await;
+                info!("[SHUTDOWN] Cancelled all orders");
+                
+                // Final reconciliation
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let final_orders = poll_active_orders(&auth_shutdown).await;
+                info!("[SHUTDOWN] Final order count: {}", final_orders.len());
+                
+                // Log final PnL
+                let inv = pnl.inv();
+                let m = data.read().await.mid;
+                info!("═══════════════════════════════════════════════════════════════");
+                info!("[SHUTDOWN] FINAL PnL REPORT");
+                info!("Runtime: {}s | Buys:{} Sells:{} | Matches:{}", 
+                    start.elapsed().as_secs(), pnl.buys, pnl.sells, pnl.matched);
+                info!("Inventory: {:.4} SOL (${:.2})", inv, inv * m);
+                info!("SPREAD: ${:.4} | REBATE: ${:.4} | NET: ${:.4}", pnl.spread, pnl.reb, pnl.net());
+                info!("═══════════════════════════════════════════════════════════════");
+                
+                break;
+            }
+            _ = recon.tick(), if !shutting_down => {
                 // ═══ ORDER RECONCILIATION ═══
                 let orders = poll_active_orders(&auth4).await;
                 let new_bal = poll_balances(&auth3).await;
                 *balances.write().await = new_bal;
                 *active_orders.write().await = orders.clone();
                 
-                // Build set of known order IDs
+                // V10: Reset pending notional on fresh balance poll
+                pending = PendingNotional::default();
+                
+                // Build set of order IDs active on exchange
                 let active_ids: HashSet<String> = orders.iter().map(|o| o.order_id.clone()).collect();
                 
-                // Update level_orders - remove any that are no longer active
-                for (_, (bid_id, ask_id)) in level_orders.iter_mut() {
-                    if let Some((ref id, _)) = bid_id {
-                        if !active_ids.contains(id) { *bid_id = None; }
+                // V10: Build set of tracked order IDs
+                let mut tracked_ids: HashSet<String> = HashSet::new();
+                
+                // V10: Reconcile level_orders with exchange state
+                for (_, (bid_state, ask_state)) in level_orders.iter_mut() {
+                    // Handle bid state
+                    match bid_state {
+                        LevelOrderState::Live { order_id, .. } => {
+                            if !active_ids.contains(order_id) {
+                                // Order filled or cancelled externally
+                                *bid_state = LevelOrderState::Empty;
+                            } else {
+                                tracked_ids.insert(order_id.clone());
+                            }
+                        }
+                        LevelOrderState::CancelPending { order_id, sent_at, .. } => {
+                            if !active_ids.contains(order_id) {
+                                // Cancel confirmed via recon
+                                *bid_state = LevelOrderState::Empty;
+                            } else if sent_at.elapsed().as_secs() > CANCEL_TIMEOUT_SECS {
+                                // V10: Cancel timeout - force clear with warning
+                                warn!("[RECON] Cancel timeout for bid {}, forcing empty", order_id);
+                                *bid_state = LevelOrderState::Empty;
+                            } else {
+                                tracked_ids.insert(order_id.clone());
+                            }
+                        }
+                        LevelOrderState::Empty => {}
                     }
-                    if let Some((ref id, _)) = ask_id {
-                        if !active_ids.contains(id) { *ask_id = None; }
+                    
+                    // Handle ask state
+                    match ask_state {
+                        LevelOrderState::Live { order_id, .. } => {
+                            if !active_ids.contains(order_id) {
+                                *ask_state = LevelOrderState::Empty;
+                            } else {
+                                tracked_ids.insert(order_id.clone());
+                            }
+                        }
+                        LevelOrderState::CancelPending { order_id, sent_at, .. } => {
+                            if !active_ids.contains(order_id) {
+                                *ask_state = LevelOrderState::Empty;
+                            } else if sent_at.elapsed().as_secs() > CANCEL_TIMEOUT_SECS {
+                                warn!("[RECON] Cancel timeout for ask {}, forcing empty", order_id);
+                                *ask_state = LevelOrderState::Empty;
+                            } else {
+                                tracked_ids.insert(order_id.clone());
+                            }
+                        }
+                        LevelOrderState::Empty => {}
                     }
                 }
                 
-                // Count tracked orders
-                let tracked: usize = level_orders.values().map(|(b, a)| {
-                    (if b.is_some() { 1 } else { 0 }) + (if a.is_some() { 1 } else { 0 })
-                }).sum();
-                
-                if orders.len() != tracked {
-                    info!("[RECON] Active:{} Tracked:{}", orders.len(), tracked);
-                }
-                
-                // ═══ ENFORCE MAX ORDERS PER SIDE (including orphans) ═══
-                // Get all active orders from REST API sorted by price distance from mid
-                let buy_orders: Vec<&ActiveOrder> = orders.iter().filter(|o| o.side == "buy").collect();
-                let sell_orders: Vec<&ActiveOrder> = orders.iter().filter(|o| o.side == "sell").collect();
-                
-                // If bids over limit, cancel furthest (lowest price = furthest from mid for bids)
-                if buy_orders.len() > MAX_ORDERS_PER_SIDE {
-                    let mut sorted_buys = buy_orders.clone();
-                    sorted_buys.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-                    let to_cancel = sorted_buys.len() - MAX_ORDERS_PER_SIDE;
-                    for order in sorted_buys.iter().take(to_cancel) {
-                        info!("[LIMIT] Cancelling excess bid: ${:.2}", order.price);
-                        let _ = ws.read().await.cancel_order(WsCancelRequest {
+                // V10: Cancel orphan orders (on exchange but not tracked)
+                for order in &orders {
+                    if !tracked_ids.contains(&order.order_id) {
+                        info!("[ORPHAN] Cancelling untracked order: {} {} @ ${:.2}", 
+                            order.side, order.order_id, order.price);
+                        let _ = ws.cancel_order(WsCancelRequest {
                             symbol: SYM.into(), order_id: Some(order.order_id.clone()), client_oid: None
                         }).await;
                     }
                 }
                 
-                // If asks over limit, cancel furthest (highest price = furthest from mid for asks)
-                if sell_orders.len() > MAX_ORDERS_PER_SIDE {
-                    let mut sorted_asks = sell_orders.clone();
-                    sorted_asks.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-                    let to_cancel = sorted_asks.len() - MAX_ORDERS_PER_SIDE;
-                    for order in sorted_asks.iter().take(to_cancel) {
-                        info!("[LIMIT] Cancelling excess ask: ${:.2}", order.price);
-                        let _ = ws.read().await.cancel_order(WsCancelRequest {
-                            symbol: SYM.into(), order_id: Some(order.order_id.clone()), client_oid: None
-                        }).await;
-                    }
+                // Log mismatch if any
+                if orders.len() != tracked_ids.len() {
+                    info!("[RECON] Active:{} Tracked:{}", orders.len(), tracked_ids.len());
                 }
             }
-            _ = fp.tick() => {
+            _ = fp.tick(), if !shutting_down => {
                 for (side, sz, px) in poll_fills(&auth2, &mut seen).await {
                     let r = sz * px * REBATE / 10000.0;
                     if side == "buy" { pnl.buy(px, sz, r); } else { pnl.sell(px, sz, r); }
                 }
             }
-            _ = tick.tick() => {
+            _ = tick.tick(), if !shutting_down => {
                 n += 1;
                 let md = data.read().await;
                 let m = md.mid;
@@ -403,11 +521,14 @@ async fn main() -> Result<()> {
                 drop(md);
                 
                 let bal = balances.read().await.clone();
-                let active = active_orders.read().await.clone();
-                let current_bids = active.iter().filter(|o| o.side == "buy").count();
-                let current_asks = active.iter().filter(|o| o.side == "sell").count();
                 
                 if m <= 0.0 { continue; }
+                
+                // V10: Count orders from local state (race-free)
+                let local_bid_count = level_orders.values()
+                    .filter(|(b, _)| !b.is_empty()).count();
+                let local_ask_count = level_orders.values()
+                    .filter(|(_, a)| !a.is_empty()).count();
                 
                 // ═══ QUANT 1: OFI ═══
                 let (mut skip_bids, mut skip_asks) = if ofi_paused {
@@ -425,14 +546,13 @@ async fn main() -> Result<()> {
                 
                 if downtrend {
                     if !mom_paused { info!("[TREND] DOWN {:.2}% - selling only", momentum * 100.0); mom_paused = true; }
-                    if inv <= 0.05 { info!("[TREND] Inv cleared, pausing"); continue; }
+                    if inv <= 0.05 { continue; }
                 } else if uptrend {
                     if !mom_paused { info!("[TREND] UP {:.2}% - buying only", momentum * 100.0); mom_paused = true; }
-                    if inv >= -0.05 { info!("[TREND] No short, pausing"); continue; }
+                    if inv >= -0.05 { continue; }
                 } else if mom_paused { info!("[TREND] Normal"); mom_paused = false; }
                 
-                skip_bids = skip_bids || downtrend; // Skip bids in downtrend
-                // skip_asks = skip_asks || uptrend; // DISABLED - always allow asks to refresh for quick exit
+                skip_bids = skip_bids || downtrend;
                 
                 // ═══ QUANT 3: Inventory Skew ═══
                 let skew_bps = inv * GAMMA * sigma * sigma * 10000.0;
@@ -446,7 +566,8 @@ async fn main() -> Result<()> {
                 // Process each level
                 for (bps, thresh) in LEVELS.iter() {
                     let key = (*bps * 10.0) as i32;
-                    let (bid_id, ask_id) = level_orders.get(&key).cloned().unwrap_or((None, None));
+                    let (bid_state, ask_state) = level_orders.get(&key).cloned()
+                        .unwrap_or((LevelOrderState::Empty, LevelOrderState::Empty));
                     
                     let max_skew = bps * 0.5;
                     let capped_skew = skew_bps.clamp(-max_skew, max_skew);
@@ -457,32 +578,57 @@ async fn main() -> Result<()> {
                     let ap = ((m * (1.0 + ask_bps / 10000.0)) / 0.01).round() * 0.01;
                     
                     // ═══ REFRESH CHECK: Cancel stale orders beyond threshold ═══
-                    if let Some((ref id, placed_px)) = bid_id {
-                        let bps_diff = ((placed_px - bp).abs() / bp) * 10000.0;
+                    // V10: Only transition to CancelPending, don't clear immediately
+                    if let LevelOrderState::Live { ref order_id, price } = bid_state {
+                        let bps_diff = ((price - bp).abs() / bp) * 10000.0;
                         if bps_diff > *thresh {
-                            let _ = ws.read().await.cancel_order(WsCancelRequest {
-                                symbol: SYM.into(), order_id: Some(id.clone()), client_oid: None
-                            }).await;
-                            level_orders.entry(key).or_insert((None, None)).0 = None;
+                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                                symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
+                            }).await {
+                                if r.success {
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = LevelOrderState::Empty;
+                                } else {
+                                    // Cancel sent but not confirmed - transition to CancelPending
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
+                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now() };
+                                }
+                            } else {
+                                // WS error - still transition to CancelPending
+                                level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
+                                    LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now() };
+                            }
                         }
                     }
-                    if let Some((ref id, placed_px)) = ask_id {
-                        let bps_diff = ((placed_px - ap).abs() / ap) * 10000.0;
+                    
+                    if let LevelOrderState::Live { ref order_id, price } = ask_state {
+                        let bps_diff = ((price - ap).abs() / ap) * 10000.0;
                         if bps_diff > *thresh {
-                            let _ = ws.read().await.cancel_order(WsCancelRequest {
-                                symbol: SYM.into(), order_id: Some(id.clone()), client_oid: None
-                            }).await;
-                            level_orders.entry(key).or_insert((None, None)).1 = None;
+                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                                symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
+                            }).await {
+                                if r.success {
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = LevelOrderState::Empty;
+                                } else {
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
+                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now() };
+                                }
+                            } else {
+                                level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
+                                    LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now() };
+                            }
                         }
                     }
                     
                     // Re-read after potential cancellation
-                    let (bid_id, ask_id) = level_orders.get(&key).cloned().unwrap_or((None, None));
+                    let (bid_state, ask_state) = level_orders.get(&key).cloned()
+                        .unwrap_or((LevelOrderState::Empty, LevelOrderState::Empty));
                     
                     // ═══ BID ORDER ═══
-                    if bid_id.is_none() && !skip_bids && inv + bid_sz <= MAX_INV_SOL 
-                        && bal.usdt >= bid_sz * bp && current_bids < MAX_ORDERS_PER_SIDE {
-                        if let Ok(r) = ws.read().await.place_order(WsOrderRequest {
+                    // V10: Only place if Empty, check local count, track pending notional
+                    let available_usdt = bal.usdt - pending.usdt_committed;
+                    if bid_state.is_empty() && !skip_bids && inv + bid_sz <= MAX_INV_SOL 
+                        && available_usdt >= bid_sz * bp && local_bid_count < MAX_ORDERS_PER_SIDE {
+                        if let Ok(r) = ws.place_order(WsOrderRequest {
                             symbol: SYM.into(), side: "buy".into(),
                             price: format!("{:.2}", bp), size: format!("{:.2}", bid_sz),
                             client_oid: format!("b{}_{}", key, n),
@@ -491,23 +637,34 @@ async fn main() -> Result<()> {
                         }).await {
                             if r.success {
                                 if let Some(ref oid) = r.order_id {
-                                    level_orders.entry(key).or_insert((None, None)).0 = Some((oid.clone(), bp));
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
+                                        LevelOrderState::Live { order_id: oid.clone(), price: bp };
+                                    // V10: Track pending notional
+                                    pending.usdt_committed += bid_sz * bp;
                                 }
                             }
                         }
-                    } else if bid_id.is_some() && (skip_bids || inv + bid_sz > MAX_INV_SOL) {
-                        if let Some((ref id, _)) = bid_id {
-                            let _ = ws.read().await.cancel_order(WsCancelRequest {
-                                symbol: SYM.into(), order_id: Some(id.clone()), client_oid: None
-                            }).await;
-                            level_orders.entry(key).or_insert((None, None)).0 = None;
+                    } else if bid_state.is_live() && (skip_bids || inv + bid_sz > MAX_INV_SOL) {
+                        // Cancel bid due to skip or inventory
+                        if let LevelOrderState::Live { ref order_id, price } = bid_state {
+                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                                symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
+                            }).await {
+                                if r.success {
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = LevelOrderState::Empty;
+                                } else {
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
+                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now() };
+                                }
+                            }
                         }
                     }
                     
                     // ═══ ASK ORDER ═══
-                    if ask_id.is_none() && !skip_asks && inv - ask_sz >= -MAX_INV_SOL 
-                        && bal.sol >= ask_sz && current_asks < MAX_ORDERS_PER_SIDE {
-                        if let Ok(r) = ws.read().await.place_order(WsOrderRequest {
+                    let available_sol = bal.sol - pending.sol_committed;
+                    if ask_state.is_empty() && !skip_asks && inv - ask_sz >= -MAX_INV_SOL 
+                        && available_sol >= ask_sz && local_ask_count < MAX_ORDERS_PER_SIDE {
+                        if let Ok(r) = ws.place_order(WsOrderRequest {
                             symbol: SYM.into(), side: "sell".into(),
                             price: format!("{:.2}", ap), size: format!("{:.2}", ask_sz),
                             client_oid: format!("a{}_{}", key, n),
@@ -516,26 +673,35 @@ async fn main() -> Result<()> {
                         }).await {
                             if r.success {
                                 if let Some(ref oid) = r.order_id {
-                                    level_orders.entry(key).or_insert((None, None)).1 = Some((oid.clone(), ap));
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
+                                        LevelOrderState::Live { order_id: oid.clone(), price: ap };
+                                    pending.sol_committed += ask_sz;
                                 }
                             }
                         }
-                    } else if ask_id.is_some() && inv - ask_sz < -MAX_INV_SOL {
-                        if let Some((ref id, _)) = ask_id {
-                            let _ = ws.read().await.cancel_order(WsCancelRequest {
-                                symbol: SYM.into(), order_id: Some(id.clone()), client_oid: None
-                            }).await;
-                            level_orders.entry(key).or_insert((None, None)).1 = None;
+                    } else if ask_state.is_live() && inv - ask_sz < -MAX_INV_SOL {
+                        if let LevelOrderState::Live { ref order_id, price } = ask_state {
+                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                                symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
+                            }).await {
+                                if r.success {
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = LevelOrderState::Empty;
+                                } else {
+                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
+                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now() };
+                                }
+                            }
                         }
                     }
                 }
             }
-            _ = log.tick() => {
+            _ = log.tick(), if !shutting_down => {
                 let md = data.read().await;
                 let m = md.mid;
                 let ofi = md.ofi;
                 let sigma = md.sigma();
                 let momentum = md.momentum();
+                let update_interval = md.update_interval_ms;
                 drop(md);
                 
                 let bal = balances.read().await.clone();
@@ -544,15 +710,22 @@ async fn main() -> Result<()> {
                 let wr = if pnl.matched > 0 { (pnl.wins as f64 / pnl.matched as f64) * 100.0 } else { 0.0 };
                 let skew = inv * GAMMA * sigma * sigma * 10000.0;
                 
+                // V10: Count local states
+                let local_bids = level_orders.values().filter(|(b, _)| !b.is_empty()).count();
+                let local_asks = level_orders.values().filter(|(_, a)| !a.is_empty()).count();
+                
                 info!("═══════════════════════════════════════════════════════════════");
                 info!("{}s | B:{} S:{} | Matches:{} (W:{} L:{}) WR:{:.0}%", 
                     start.elapsed().as_secs(), pnl.buys, pnl.sells, pnl.matched, pnl.wins, pnl.losses, wr);
-                info!("ORDERS:{} | Inv:{:.3} ${:.0} | OFI:{:.3} | σ:{:.3} | Mom:{:.2}% | Skew:{:.1}bps", 
-                    orders, inv, inv * m, ofi, sigma, momentum * 100.0, skew);
-                info!("BAL: {:.4} SOL, {:.2} USDT", bal.sol, bal.usdt);
+                info!("ORDERS:{} (L:{}/{}) | Inv:{:.3} ${:.0} | OFI:{:.3} | σ:{:.3} | Mom:{:.2}%", 
+                    orders, local_bids, local_asks, inv, inv * m, ofi, sigma, momentum * 100.0);
+                info!("BAL: {:.4} SOL, {:.2} USDT | Skew:{:.1}bps | Interval:{:.0}ms", 
+                    bal.sol, bal.usdt, skew, update_interval);
                 info!("SPREAD: ${:.4} | REBATE: ${:.4} | NET: ${:.4}", pnl.spread, pnl.reb, pnl.net());
                 info!("═══════════════════════════════════════════════════════════════");
             }
         }
     }
+    
+    Ok(())
 }

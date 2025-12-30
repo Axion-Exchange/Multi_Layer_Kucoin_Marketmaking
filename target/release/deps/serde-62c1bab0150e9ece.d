@@ -1,0 +1,14 @@
+/Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/deps/serde-62c1bab0150e9ece.d: /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/build/serde-a21087bddc1c537a/out/private.rs
+
+/Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/deps/libserde-62c1bab0150e9ece.rlib: /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/build/serde-a21087bddc1c537a/out/private.rs
+
+/Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/deps/libserde-62c1bab0150e9ece.rmeta: /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/build/serde-a21087bddc1c537a/out/private.rs
+
+/Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/marwan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/build/serde-a21087bddc1c537a/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/marwan/Documents/Multi_Layer_Kucoin_Marketmaking/target/release/build/serde-a21087bddc1c537a/out
