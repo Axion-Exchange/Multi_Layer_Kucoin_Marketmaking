@@ -237,12 +237,25 @@ impl PnL {
 #[derive(Default)]
 struct MarketData {
     mid: f64, ofi: f64, last_mid: f64, ewma_var: f64,
+    // V10.5c: Weighted mid price (0.8 Binance + 0.2 KuCoin)
+    kucoin_mid: f64,
     price_history: VecDeque<(Instant, f64)>,
     // V10: Track actual update interval for correct sigma annualization
     last_update: Option<Instant>,
     update_interval_ms: f64,
 }
+
 impl MarketData {
+    // V10.5c: Weighted fair mid - 80% Binance futures, 20% KuCoin spot
+    // Filters out "fake outs" where futures moves but spot doesn't
+    fn fair_mid(&self) -> f64 {
+        if self.kucoin_mid > 0.0 {
+            0.8 * self.mid + 0.2 * self.kucoin_mid
+        } else {
+            self.mid  // Fallback to Binance only if no KuCoin data
+        }
+    }
+    
     fn update(&mut self) {
         let now = Instant::now();
         
@@ -332,6 +345,26 @@ async fn binance_feed(data: Arc<RwLock<MarketData>>) {
 // ═══════════════════════════════════════════════════════════════════
 // REST API FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════
+
+// V10.5c: Fetch KuCoin spot ticker for weighted mid calculation
+async fn poll_kucoin_ticker() -> f64 {
+    if let Ok(r) = reqwest::Client::new()
+        .get("https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=SOL-USDT")
+        .send().await
+    {
+        if let Ok(v) = r.json::<serde_json::Value>().await {
+            if let Some(data) = v["data"].as_object() {
+                let bid: f64 = data.get("bestBid").and_then(|v| v.as_str()).unwrap_or("0").parse().unwrap_or(0.0);
+                let ask: f64 = data.get("bestAsk").and_then(|v| v.as_str()).unwrap_or("0").parse().unwrap_or(0.0);
+                if bid > 0.0 && ask > 0.0 {
+                    return (bid + ask) / 2.0;
+                }
+            }
+        }
+    }
+    0.0
+}
+
 async fn poll_balances(auth: &KucoinAuth) -> Balances {
     let ep = "/api/v1/accounts?type=trade";
     let (ts, sig, pw, ver) = auth.sign("GET", ep, "");
@@ -554,6 +587,12 @@ async fn main() -> Result<()> {
                 *balances.write().await = new_bal.clone();
                 *active_orders.write().await = orders.clone();
                 
+                // V10.5c: Update KuCoin mid for weighted fair price
+                let kc_mid = poll_kucoin_ticker().await;
+                if kc_mid > 0.0 {
+                    data.write().await.kucoin_mid = kc_mid;
+                }
+                
                 // V10.3: Reset inflight commitments (anything not confirmed is orphan)
                 commitments.reset_inflight();
                 
@@ -713,7 +752,8 @@ async fn main() -> Result<()> {
             _ = tick.tick(), if !shutting_down => {
                 n += 1;
                 let md = data.read().await;
-                let m = md.mid;
+                // V10.5c: Use weighted fair mid (0.8 Binance + 0.2 KuCoin)
+                let m = md.fair_mid();
                 let ofi = md.ofi;
                 let sigma = md.sigma();
                 let momentum = md.momentum();
