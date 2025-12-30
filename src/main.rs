@@ -16,14 +16,14 @@ use exchange::ws_order_client_v2::{WsOrderClientV2, WsOrderRequest, WsCancelRequ
 // CONFIGURATION - 25 LAYERS PER SIDE
 // ═══════════════════════════════════════════════════════════════════
 const LEVELS: [(f64, f64); 25] = [
-    // Close layers: tighter refresh (50% of spread)
-    (0.55, 0.28), (1.23, 0.62), (1.91, 0.96), (2.59, 1.30), (3.27, 1.64),
-    (3.95, 1.98), (4.63, 2.32), (5.31, 2.66), (5.99, 3.00), (6.67, 3.34),
-    // Mid layers: moderate refresh
-    (7.35, 4.0), (8.03, 4.5), (8.71, 5.0), (9.39, 5.5), (10.07, 6.0),
-    // Far layers: wider refresh (match spread)
-    (10.75, 10.75), (11.43, 11.43), (12.11, 12.11), (12.79, 12.79), (13.47, 13.47),
-    (14.15, 14.15), (14.83, 14.83), (15.51, 15.51), (16.19, 16.19), (16.87, 16.87)
+    // Close layers: tighter refresh (+20% vs original)
+    (0.55, 0.34), (1.23, 0.74), (1.91, 1.15), (2.59, 1.56), (3.27, 1.97),
+    (3.95, 2.38), (4.63, 2.78), (5.31, 3.19), (5.99, 3.60), (6.67, 4.01),
+    // Mid layers: moderate refresh (+20%)
+    (7.35, 4.8), (8.03, 5.4), (8.71, 6.0), (9.39, 6.6), (10.07, 7.2),
+    // Far layers: wider refresh (match spread - no change needed)
+    (10.75, 12.90), (11.43, 13.72), (12.11, 14.53), (12.79, 15.35), (13.47, 16.16),
+    (14.15, 16.98), (14.83, 17.80), (15.51, 18.61), (16.19, 19.43), (16.87, 20.24)
 ];
 const ORDER_USD: f64 = 10.0;
 const MAX_INV_SOL: f64 = 15.0;
@@ -665,13 +665,20 @@ async fn main() -> Result<()> {
                 let uptrend = momentum > MOMENTUM_THRESHOLD;
                 let inv = pnl.inv();
                 
+                // Downtrend: pause if not holding long (protect from falling knife)
                 if downtrend {
                     if !mom_paused { info!("[TREND] DOWN {:.2}% - selling only", momentum * 100.0); mom_paused = true; }
                     if inv <= 0.05 { continue; }
-                } else if uptrend {
-                    if !mom_paused { info!("[TREND] UP {:.2}% - buying only", momentum * 100.0); mom_paused = true; }
-                    if inv >= -0.05 { continue; }
-                } else if mom_paused { info!("[TREND] Normal"); mom_paused = false; }
+                } else if !uptrend && mom_paused { 
+                    info!("[TREND] Normal"); 
+                    mom_paused = false; 
+                }
+                
+                // Uptrend: keep quoting but widen spreads to capture momentum
+                let uptrend_multiplier = if uptrend {
+                    if !mom_paused { info!("[TREND] UP {:.2}% - widening spreads 1.5x", momentum * 100.0); mom_paused = true; }
+                    1.5  // Widen asks by 50% to capture more during rally
+                } else { 1.0 };
                 
                 skip_bids = skip_bids || downtrend;
                 
@@ -693,7 +700,8 @@ async fn main() -> Result<()> {
                     let max_skew = bps * 0.5;
                     let capped_skew = skew_bps.clamp(-max_skew, max_skew);
                     let bid_bps = bps + capped_skew;
-                    let ask_bps = bps - capped_skew;
+                    // Apply uptrend multiplier to asks (widen during rallies)
+                    let ask_bps = (bps - capped_skew) * uptrend_multiplier;
                     
                     let bp = ((m * (1.0 - bid_bps / 10000.0)) / 0.01).round() * 0.01;
                     let ap = ((m * (1.0 + ask_bps / 10000.0)) / 0.01).round() * 0.01;
