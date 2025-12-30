@@ -726,15 +726,21 @@ impl WsOrderClientV2 {
         let tx = self.get_sender().await?;
         
         let id = format!("cancel_{}", self.next_id());
-        // KuCoin Pro API format for order cancellation
+        
+        // Build args object manually to avoid null values
+        let mut args_obj = serde_json::Map::new();
+        args_obj.insert("symbol".to_string(), serde_json::Value::String(req.symbol));
+        if let Some(oid) = req.order_id {
+            args_obj.insert("orderId".to_string(), serde_json::Value::String(oid));
+        }
+        if let Some(coid) = req.client_oid {
+            args_obj.insert("clientOid".to_string(), serde_json::Value::String(coid));
+        }
+        
         let msg = json!({
             "id": id,
             "op": "spot.cancel",
-            "args": [{
-                "symbol": req.symbol,
-                "orderId": req.order_id,
-                "clientOid": req.client_oid,
-            }]
+            "args": [serde_json::Value::Object(args_obj)]
         });
         
         let (resp_tx, resp_rx) = oneshot::channel();
