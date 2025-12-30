@@ -1,0 +1,735 @@
+//! KuCoin Pure Market Maker - INSTITUTIONAL GRADE v0.4
+//!
+//! Features:
+//! - WebSocket order entry via Co-location endpoint
+//! - Real-time fill tracking via private WebSocket
+//! - REST polling fallback every 5s
+//! - Auto-reconnection with exponential backoff
+//! - Full position and P&L tracking
+
+mod config;
+mod quant;
+mod exchange;
+mod strategy;
+mod error;
+mod risk;
+
+use anyhow::Result;
+use tracing::{info, warn, error, Level};
+use tracing_subscriber::FmtSubscriber;
+use tokio::time::{Duration, interval};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::config::Config;
+use crate::exchange::{
+    KucoinAuth, KucoinRestClient, KucoinEndpoints,
+    OrderRequest, Side, OrderType, TimeInForce,
+    KucoinPrivateWs, new_shared_order_manager, OrderSide,
+    WsOrderClientV2, WsOrderRequest, WsCancelRequest,
+};
+use crate::quant::{
+    VolatilityTracker, InventoryManager, BinanceWsFeed,
+    LqSkewingCalculator, ElasticSizer, FillQualityTracker, FillQualityAction,
+    FqFillSide as FillSide, TrendDetector, TrendConfig, TrendState,
+    // === PRODUCTION QUANT MODULES ===
+    PositionAgeTracker, PositionFillSide, ExitUrgency,
+    ToxicityShield, ToxicityInputs, QuoteSide,
+    KellySizer, KellyTradeSide,
+    VpinTracker,
+    // === BINANCE FUTURES + WEIGHTED FAIR PRICE ===
+    BinanceFuturesFeed, FuturesState,
+    WeightedFairPrice, WeightedSignalConfig, DeltaSignal, DeltaProtection,
+};
+
+use crate::risk::{KillSwitch, KillSwitchConfig, KillAction};
+#[tokio::main]
+async fn main() -> Result<()> {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    info!("╔════════════════════════════════════════════════════════════╗");
+    info!("║     KuCoin MM - INSTITUTIONAL GRADE v0.4 [WS ORDERS]      ║");
+    info!("║     Co-location WS • Real-time fills • PnL tracking       ║");
+    info!("╚════════════════════════════════════════════════════════════╝");
+    info!("");
+
+    // Load config
+    let config = Config::load()?;
+    info!("[INIT] {} | Size: ${:.0} | Spread: {:.1}bps | Maker: {:.2}%", 
+        config.market.symbol, 
+        config.strategy.order_size_quote, 
+        config.strategy.base_spread_bps,
+        config.quant.pnl.maker_fee * 100.0);
+
+    // Initialize KuCoin auth
+    let auth = KucoinAuth::new(
+        config.kucoin.api_key.clone(),
+        config.kucoin.api_secret.clone(),
+        config.kucoin.api_passphrase.clone(),
+        config.kucoin.use_passphrase_v2,
+    );
+
+    let endpoints = KucoinEndpoints {
+        rest_url: config.kucoin.rest_base_url.clone(),
+        ws_public_url: config.kucoin.ws_public_url.clone(),
+        ws_private_url: config.kucoin.ws_private_url.clone(),
+    };
+
+    // Create REST client (for cancels and fallback)
+    let rest_client = Arc::new(KucoinRestClient::new(&endpoints, auth.clone())?);
+    info!("[INIT] REST client: {}", config.kucoin.rest_base_url);
+
+    // Create WebSocket order client for co-location
+    let use_ws_orders = config.kucoin.use_ws_orders.unwrap_or(false);
+    let ws_order_url = config.kucoin.ws_order_url.clone()
+        .unwrap_or_else(|| "wss://fgtyhceu.kucoin.com/v1/priv".to_string());
+    
+    let ws_order_client = if use_ws_orders {
+        info!("[INIT] WS Order entry ENABLED: {}", ws_order_url);
+        let mut client = WsOrderClientV2::new(
+            auth.clone(),
+            config.kucoin.rest_base_url.clone(),
+            ws_order_url,
+        );
+        
+        // Connect to WS order endpoint
+        match client.connect().await {
+            Ok(_) => {
+                info!("[INIT] ✓ Connected to WS order endpoint");
+                Some(Arc::new(RwLock::new(client)))
+            }
+            Err(e) => {
+                warn!("[INIT] WS order connect failed: {} - falling back to REST", e);
+                None
+            }
+        }
+    } else {
+        info!("[INIT] WS Order entry DISABLED - using REST");
+        None
+    };
+
+    // Create order manager for tracking fills
+    let order_manager = new_shared_order_manager(config.quant.pnl.maker_fee);
+    info!("[INIT] Order manager created");
+
+    // Start Binance price feed
+    let binance_symbol = config.quant.lead_lag.binance_symbol.clone();
+    let binance_feed = BinanceWsFeed::new(binance_symbol.clone(), 10);
+    let binance_state = binance_feed.state();
+    let _binance_handle = binance_feed.start().await?;
+    info!("[INIT] Binance feed: {}", binance_symbol);
+
+    // Start KuCoin private WebSocket for fills
+    let kucoin_ws = KucoinPrivateWs::new(
+        auth.clone(),
+        config.kucoin.rest_base_url.clone(),
+        config.kucoin.ws_private_url.clone(),
+        order_manager.clone(),
+        config.market.symbol.clone(),
+    );
+    let ws_state = kucoin_ws.state();
+    let _kucoin_ws_handle = kucoin_ws.start().await?;
+    info!("[INIT] KuCoin private WS: {}", config.kucoin.ws_private_url);
+
+    // Wait for connections
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+
+    // === STARTUP: Cancel all stale orders from previous sessions ===
+    info!("[INIT] Cleaning up any stale orders from previous sessions...");
+    match rest_client.cancel_all_orders(&config.market.symbol).await {
+        Ok(count) => {
+            if count > 0 {
+                info!("[INIT] Cancelled {} stale orders", count);
+            } else {
+                info!("[INIT] No stale orders found");
+            }
+        },
+        Err(e) => warn!("[INIT] Stale order cleanup failed: {}", e),
+    }
+    // Initialize quant modules
+    let mut vol_tracker = VolatilityTracker::new(config.quant.volatility.lookback_secs);
+    let mut inv_mgr = InventoryManager::new(0.5, config.quant.inventory.max_skew_bps);
+
+    // === KRYPTON MODULES ===
+    let mut lq_skewing = LqSkewingCalculator::new(config.quant.lq_skewing.clone());
+    let elastic_sizer = ElasticSizer::new(config.quant.elastic_sizing.clone());
+    let mut fill_tracker = FillQualityTracker::new(config.quant.fill_quality.clone());
+    let mut trend_detector = TrendDetector::new(TrendConfig::default());
+    
+    // === PRODUCTION QUANT MODULES ===
+    let mut position_age = PositionAgeTracker::new(config.quant.position_age.clone());
+    let mut toxicity_shield = ToxicityShield::new(config.quant.toxicity_shield.clone());
+    let mut kelly_sizer = KellySizer::new(config.quant.kelly_sizing.clone());
+    let mut vpin_tracker = VpinTracker::new(config.quant.vpin.bucket_size_quote, 20);
+    
+    // === BINANCE FUTURES FEED ===
+    let futures_feed = BinanceFuturesFeed::new("SOLUSDT".to_string());
+    let futures_state = futures_feed.state();
+    let _futures_handle = futures_feed.start().await?;
+    info!("[FUTURES] Connected to Binance USDS-M Futures for SOLUSDT");
+    
+    // === WEIGHTED FAIR PRICE ===
+    let mut weighted_fair = WeightedFairPrice::new(WeightedSignalConfig::default());
+    info!("[WEIGHTED] Futures weight: 80% | Delta trigger: 3bps");
+    
+    info!("[PRODUCTION] Position-Age: {}ms | Toxicity: {} | Kelly: {} | VPIN: ON",
+        config.quant.position_age.max_position_age_ms,
+        if config.quant.toxicity_shield.enabled { "ON" } else { "OFF" },
+        if config.quant.kelly_sizing.enabled { "ON" } else { "OFF" });
+    
+    info!("[KRYPTON] LQ-Skewing: {} | Elastic: {} | Fill-Quality: {}",
+        if config.quant.lq_skewing.enabled { "ON" } else { "OFF" },
+        if config.quant.elastic_sizing.enabled { "ON" } else { "OFF" },
+        if config.quant.fill_quality.enabled { "ON" } else { "OFF" });
+
+    // Tracking for quote management
+    let mut active_bid_id: Option<String> = None;
+    let mut active_ask_id: Option<String> = None;
+    let mut last_bid_price: f64 = 0.0;
+    let mut last_ask_price: f64 = 0.0;
+
+    info!("");
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("[LIVE] Starting MM Loop - {} {}", config.market.symbol,
+        if ws_order_client.is_some() { "[WS ORDERS]" } else { "[REST ORDERS]" });
+    info!("═══════════════════════════════════════════════════════════════");
+
+    // Main trading loop
+    let mut ticker = interval(Duration::from_millis(config.strategy.refresh_interval_ms));
+    let mut poll_ticker = interval(Duration::from_secs(5));
+    let mut latency_ticker = interval(Duration::from_secs(30));
+    let mut quote_count: u64 = 0;
+    let mut last_poll_fills: u64 = 0;
+    let mut kill_switch = KillSwitch::new(KillSwitchConfig::default());
+    let mut last_pnl = 0.0f64;
+    let mut last_nuclear_reset = std::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                quote_count += 1;
+
+
+                // === NUCLEAR RESET: Cancel all orders every 15s to prevent stale orders ===
+                if last_nuclear_reset.elapsed().as_secs() >= 15 {
+                    match rest_client.cancel_all_orders(&config.market.symbol).await {
+                        Ok(count) => {
+                            if count > 0 {
+                                info!("[NUCLEAR] Reset: cancelled {} stale orders", count);
+                            }
+                        },
+                        Err(e) => warn!("[NUCLEAR] Reset failed: {}", e),
+                    }
+                    active_bid_id = None;
+                    active_ask_id = None;
+                    last_nuclear_reset = std::time::Instant::now();
+                }
+                // Get Binance price
+                let state = binance_state.read().await;
+                let mut mid_price = state.mid;
+                if mid_price <= 0.0 {
+                    if quote_count > 50 { mid_price = 200.0; }
+                    if quote_count % 100 == 0 {
+                        warn!("[{}] Waiting for Binance price...", quote_count);
+                    }
+                    continue;
+                }
+                drop(state);
+
+                // === PRICE GUARD: Store reference price for deviation check ===
+                let price_at_calc = mid_price;
+
+                // Update volatility
+                vol_tracker.update(mid_price);
+                let vol_mult = vol_tracker.spread_multiplier(
+                    config.quant.volatility.min_spread_mult,
+                    config.quant.volatility.max_spread_mult,
+                    0.02,
+                    0.10,
+                );
+                
+                // === KRYPTON: Update LQ skewing volatility ===
+                lq_skewing.update_volatility(vol_tracker.realized_vol());
+                
+                // === KRYPTON: Check fill quality and adjust spread ===
+                fill_tracker.check_fills(mid_price);
+                let fill_quality_mult = fill_tracker.spread_multiplier();
+                let should_pause = fill_tracker.should_pause();
+                if should_pause {
+                    warn!("[KRYPTON] High adverse rate detected - pausing quotes");
+                    continue;
+                }
+                
+                // === POSITION AGE CHECK ===
+                let age_stats = position_age.get_stats();
+                let age_skew_mult = age_stats.skew_multiplier;
+                if age_stats.urgency == ExitUrgency::ForceExit {
+                    warn!("🔴 MAX AGE ({} ms) - URGENT EXIT", 
+                        config.quant.position_age.max_position_age_ms);
+                }
+                
+                // === TOXICITY SHIELD ===
+                let tox_spread_mult = if config.quant.toxicity_shield.enabled {
+                    // Get real inputs for toxicity calculation
+                    let state = binance_state.read().await;
+                    let book_imbalance = state.imbalance;
+                    drop(state);
+                    let fill_quality_adverse = fill_tracker.adverse_rate();
+                    
+                    let inputs = ToxicityInputs {
+                        vpin: vpin_tracker.vpin(),
+                        order_book_imbalance: book_imbalance,
+                        lead_lag_deviation_bps: 0.0,
+                        fill_quality_score: fill_quality_adverse,
+                        lead_lag_valid: true,
+                    };
+                    toxicity_shield.calculate_toxicity(QuoteSide::Bid, &inputs);
+                    toxicity_shield.spread_multiplier(QuoteSide::Bid).max(
+                        toxicity_shield.spread_multiplier(QuoteSide::Ask))
+                } else {
+                    1.0
+                };
+                
+                if config.quant.toxicity_shield.enabled && 
+                   toxicity_shield.should_pause(QuoteSide::Bid) {
+                    warn!("🛡️ TOXICITY SHIELD - Pausing bids");
+                    continue;
+                }
+                
+                // === WEIGHTED FAIR PRICE - Delta Signal ===
+                let futures = futures_state.read().await;
+                let delta_signal = weighted_fair.delta_signal(&futures, &*binance_state.read().await);
+                let (bid_delta_mult, ask_delta_mult) = weighted_fair.get_protection_action(&delta_signal);
+                
+                // Use weighted signal price if futures data is valid
+                let fair_price = if futures.is_valid(100) {
+                    weighted_fair.signal_price(&futures, &*binance_state.read().await)
+                } else {
+                    mid_price
+                };
+                drop(futures);
+
+                // Get position from order manager
+                let mgr = order_manager.read().await;
+                let position = mgr.position();
+                let realized_pnl = mgr.realized_pnl();
+                let rebates = mgr.rebates();
+                let (fills, _vol_base, _vol_quote) = mgr.stats();
+                drop(mgr);
+
+                // === KILL SWITCH: Check PnL delta ===
+                let pnl_with_rebates = realized_pnl + rebates;
+                if (pnl_with_rebates - last_pnl).abs() > 0.001 {
+                    let pnl_delta = pnl_with_rebates - last_pnl;
+                    last_pnl = pnl_with_rebates;
+                    match kill_switch.check(pnl_delta) {
+                        KillAction::HaltTrading(reason) => {
+                            error!("🛑 KILL SWITCH TRIGGERED: {}", reason);
+                            rest_client.cancel_all_orders(&config.market.symbol).await.ok();
+                            break;
+                        },
+                        KillAction::WidenSpreads => {
+                            // Widening handled via spread multipliers
+                        },
+                        _ => {},
+                    }
+                }
+
+                // === KRYPTON: LQ-Optimal Inventory Skewing ===
+                let (reservation_price, skew_bps) = lq_skewing.calculate_reservation_price(
+                    position,
+                    mid_price,
+                    Some(vol_tracker.realized_vol()),
+                );
+                // Trend detection: update with mid price and get asymmetric multipliers
+                let trend_state = trend_detector.update(mid_price);
+                let (bid_mult, ask_mult) = trend_detector.quote_multipliers();
+                
+                let (bid_skew, ask_skew): (f64, f64) = if config.quant.lq_skewing.enabled {
+                    let (base_bid, base_ask) = lq_skewing.calculate_quote_skew(position, config.risk.max_position_base);
+                    // Apply trend + age + delta protection multipliers
+                    (base_bid * bid_mult * age_skew_mult * bid_delta_mult, 
+                     base_ask * ask_mult * age_skew_mult * ask_delta_mult)
+                } else {
+                    let (base_bid, base_ask) = inv_mgr.skew_bps(position);
+                    (base_bid * bid_mult * age_skew_mult * bid_delta_mult, 
+                     base_ask * ask_mult * age_skew_mult * ask_delta_mult)
+                };
+
+                // Calculate quote prices with fill quality adjustment
+                let adjusted_spread_bps = config.strategy.base_spread_bps * vol_mult * fill_quality_mult * tox_spread_mult;
+                let base_spread = reservation_price * adjusted_spread_bps / 10000.0;
+                let bid_price = reservation_price - base_spread - (reservation_price * bid_skew / 10000.0);
+                let ask_price = reservation_price + base_spread + (reservation_price * ask_skew / 10000.0);
+
+                // Round to tick
+                let bid_price = (bid_price / config.market.price_tick).round() * config.market.price_tick;
+                let ask_price = (ask_price / config.market.price_tick).round() * config.market.price_tick;
+
+                let bid_moved = (bid_price - last_bid_price).abs() >= config.market.price_tick * 2.0;
+                let ask_moved = (ask_price - last_ask_price).abs() >= config.market.price_tick * 2.0;
+
+                // Check position limits
+                let position_can_bid = position < config.risk.max_position_base;
+                let position_can_ask = position > -config.risk.max_position_base;
+                
+                // In strong trends, pause quoting on the adverse side
+                // Downtrend: don't bid (avoid buying into falling market)
+                // Uptrend: don't ask (avoid selling into rising market)
+                let trend_strength = trend_detector.strength();
+                let strong_trend_threshold = 0.7;  // 50% trend strength
+                
+                let trend_skip_bid = trend_state == TrendState::Downtrend && trend_strength > strong_trend_threshold;
+                let trend_skip_ask = trend_state == TrendState::Uptrend && trend_strength > strong_trend_threshold;
+                
+                let can_bid = position_can_bid && !trend_skip_bid;
+                let can_ask = position_can_ask && !trend_skip_ask;
+                
+                // Log when trend is causing quote pause
+                if trend_skip_bid {
+                    info!("[TREND] Strong downtrend ({:.0}%) - PAUSING BIDS", trend_strength * 100.0);
+                }
+                if trend_skip_ask {
+                    info!("[TREND] Strong uptrend ({:.0}%) - PAUSING ASKS", trend_strength * 100.0);
+                }
+
+                // Log every 10s
+                let log_interval = (10000 / config.strategy.refresh_interval_ms).max(1);
+                if quote_count % log_interval == 0 {
+                    let spread_bps = (ask_price - bid_price) / mid_price * 10000.0;
+                    let ws_connected = matches!(*ws_state.read().await, 
+                        crate::exchange::ConnectionState::Connected);
+                    let ws_order_status = if let Some(ref client) = ws_order_client {
+                        if client.read().await.is_connected() { "WS" } else { "REST-fb" }
+                    } else { "REST" };
+                    info!("[{}s] Mid:{:.4} | Pos:{:.4} | PnL:${:.4} | Reb:${:.4} | {} | {}",
+                        quote_count * config.strategy.refresh_interval_ms / 1000,
+                        mid_price, position, realized_pnl, rebates, fills,
+                        ws_order_status);
+                }
+
+                // Update bid
+                if bid_moved && can_bid {
+                    // Cancel old order via REST (more reliable)
+                    if let Some(ref old_id) = active_bid_id {
+                        let _ = rest_client.cancel_order(old_id).await;
+                    }
+
+                    let mut base_size = config.strategy.order_size_quote / bid_price;
+                    // === KELLY SIZING ===
+                    if config.quant.kelly_sizing.enabled {
+                        base_size *= kelly_sizer.size_multiplier();
+                    }
+                    // === KRYPTON: Elastic sizing based on distance from fair ===
+                    let size = if config.quant.elastic_sizing.enabled {
+                        let inv_ratio = position / config.risk.max_position_base;
+                        let (bid_sz, _) = elastic_sizer.calculate_bid_ask_sizes(
+                            reservation_price, bid_price, ask_price, base_size, inv_ratio
+                        );
+                        bid_sz
+                    } else {
+                        base_size
+                    };
+                    let size = (size / config.market.size_step).floor() * config.market.size_step;
+
+                    if size >= config.market.size_step {
+                        // === PRE-TRADE CHECK: Verify price hasn't moved too much ===
+                        if config.quant.stale_protection.enabled && config.quant.stale_protection.pre_trade_check {
+                            let current_state = binance_state.read().await;
+                            let current_mid = current_state.mid;
+                            drop(current_state);
+                            
+                            let deviation_bps = ((current_mid - price_at_calc) / price_at_calc).abs() * 10000.0;
+                            if deviation_bps > config.quant.stale_protection.max_deviation_bps {
+                                // Price moved too much - skip this order to avoid adverse selection
+                                if quote_count % 100 == 0 {
+                                    warn!("[GUARD] Skipped bid: deviation {:.2}bps > {:.1}bps threshold",
+                                        deviation_bps, config.quant.stale_protection.max_deviation_bps);
+                                }
+                                continue; // Skip to next tick
+                            }
+                        }
+
+                        let client_oid = format!("bid_{}", quote_count);
+                        
+                        // Try WS first, fallback to REST
+                        let order_result = if let Some(ref ws_client) = ws_order_client {
+                            let client = ws_client.read().await;
+                            if client.is_connected() {
+                                let ws_req = WsOrderRequest {
+                                    symbol: config.market.symbol.clone(),
+                                    side: "buy".to_string(),
+                                    price: format!("{:.4}", bid_price),
+                                    size: format!("{:.2}", size),
+                                    client_oid: client_oid.clone(),
+                                    order_type: "limit".to_string(),
+                                    time_in_force: Some("GTC".to_string()),
+                                };
+                                drop(client);
+                                let client = ws_client.read().await;
+                                match client.place_order(ws_req).await {
+                                    Ok(resp) if resp.success => Ok(resp.order_id.unwrap_or(client_oid.clone())),
+                                    Ok(resp) => Err(anyhow::anyhow!("WS order failed: {:?}", resp.msg)),
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                drop(client);
+                                // Fallback to REST
+                                let order = OrderRequest {
+                                    client_oid: client_oid.clone(),
+                                    side: Side::Buy,
+                                    symbol: config.market.symbol.clone(),
+                                    order_type: OrderType::Limit,
+                                    price: format!("{:.4}", bid_price),
+                                    size: format!("{:.2}", size),
+                                    time_in_force: Some(TimeInForce::GTC),
+                                    post_only: Some(true),
+                                    hidden: None,
+                                    iceberg: None,
+                                };
+                                rest_client.place_order(&order).await
+                            }
+                        } else {
+                            // REST only mode
+                            let order = OrderRequest {
+                                client_oid: client_oid.clone(),
+                                side: Side::Buy,
+                                symbol: config.market.symbol.clone(),
+                                order_type: OrderType::Limit,
+                                price: format!("{:.4}", bid_price),
+                                size: format!("{:.2}", size),
+                                time_in_force: Some(TimeInForce::GTC),
+                                post_only: Some(true),
+                                hidden: None,
+                                iceberg: None,
+                            };
+                            rest_client.place_order(&order).await
+                        };
+
+                        match order_result {
+                            Ok(order_id) => {
+                                let mut mgr = order_manager.write().await;
+                                mgr.register_order(
+                                    order_id.clone(),
+                                    client_oid,
+                                    config.market.symbol.clone(),
+                                    OrderSide::Buy,
+                                    bid_price,
+                                    size,
+                                );
+                                drop(mgr);
+
+                                active_bid_id = Some(order_id);
+                                last_bid_price = bid_price;
+                                
+                                // === KRYPTON: Record fill for quality tracking ===
+                                // (This will be updated when we get the actual fill notification)
+                            }
+                            Err(e) => {
+                                if quote_count % 50 == 0 {
+                                    error!("Bid failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Update ask
+                if ask_moved && can_ask {
+                    if let Some(ref old_id) = active_ask_id {
+                        let _ = rest_client.cancel_order(old_id).await;
+                    }
+
+                    let base_size = config.strategy.order_size_quote / ask_price;
+                    // === KRYPTON: Elastic sizing based on distance from fair ===
+                    let size = if config.quant.elastic_sizing.enabled {
+                        let inv_ratio = position / config.risk.max_position_base;
+                        let (_, ask_sz) = elastic_sizer.calculate_bid_ask_sizes(
+                            reservation_price, bid_price, ask_price, base_size, inv_ratio
+                        );
+                        ask_sz
+                    } else {
+                        base_size
+                    };
+                    let size = (size / config.market.size_step).floor() * config.market.size_step;
+
+                    if size >= config.market.size_step {
+                        // === PRE-TRADE CHECK: Verify price hasn't moved too much ===
+                        if config.quant.stale_protection.enabled && config.quant.stale_protection.pre_trade_check {
+                            let current_state = binance_state.read().await;
+                            let current_mid = current_state.mid;
+                            drop(current_state);
+                            
+                            let deviation_bps = ((current_mid - price_at_calc) / price_at_calc).abs() * 10000.0;
+                            if deviation_bps > config.quant.stale_protection.max_deviation_bps {
+                                // Price moved too much - skip this order to avoid adverse selection
+                                if quote_count % 100 == 0 {
+                                    warn!("[GUARD] Skipped ask: deviation {:.2}bps > {:.1}bps threshold",
+                                        deviation_bps, config.quant.stale_protection.max_deviation_bps);
+                                }
+                                continue; // Skip to next tick
+                            }
+                        }
+
+                        let client_oid = format!("ask_{}", quote_count);
+                        
+                        // Try WS first, fallback to REST
+                        let order_result = if let Some(ref ws_client) = ws_order_client {
+                            let client = ws_client.read().await;
+                            if client.is_connected() {
+                                let ws_req = WsOrderRequest {
+                                    symbol: config.market.symbol.clone(),
+                                    side: "sell".to_string(),
+                                    price: format!("{:.4}", ask_price),
+                                    size: format!("{:.2}", size),
+                                    client_oid: client_oid.clone(),
+                                    order_type: "limit".to_string(),
+                                    time_in_force: Some("GTC".to_string()),
+                                };
+                                drop(client);
+                                let client = ws_client.read().await;
+                                match client.place_order(ws_req).await {
+                                    Ok(resp) if resp.success => Ok(resp.order_id.unwrap_or(client_oid.clone())),
+                                    Ok(resp) => Err(anyhow::anyhow!("WS order failed: {:?}", resp.msg)),
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                drop(client);
+                                let order = OrderRequest {
+                                    client_oid: client_oid.clone(),
+                                    side: Side::Sell,
+                                    symbol: config.market.symbol.clone(),
+                                    order_type: OrderType::Limit,
+                                    price: format!("{:.4}", ask_price),
+                                    size: format!("{:.2}", size),
+                                    time_in_force: Some(TimeInForce::GTC),
+                                    post_only: Some(true),
+                                    hidden: None,
+                                    iceberg: None,
+                                };
+                                rest_client.place_order(&order).await
+                            }
+                        } else {
+                            let order = OrderRequest {
+                                client_oid: client_oid.clone(),
+                                side: Side::Sell,
+                                symbol: config.market.symbol.clone(),
+                                order_type: OrderType::Limit,
+                                price: format!("{:.4}", ask_price),
+                                size: format!("{:.2}", size),
+                                time_in_force: Some(TimeInForce::GTC),
+                                post_only: Some(true),
+                                hidden: None,
+                                iceberg: None,
+                            };
+                            rest_client.place_order(&order).await
+                        };
+
+                        match order_result {
+                            Ok(order_id) => {
+                                let mut mgr = order_manager.write().await;
+                                mgr.register_order(
+                                    order_id.clone(),
+                                    client_oid,
+                                    config.market.symbol.clone(),
+                                    OrderSide::Sell,
+                                    ask_price,
+                                    size,
+                                );
+                                drop(mgr);
+
+                                active_ask_id = Some(order_id);
+                                last_ask_price = ask_price;
+                                
+                                // === KRYPTON: Record fill for quality tracking ===
+                                // (This will be updated when we get the actual fill notification)
+                            }
+                            Err(e) => {
+                                if quote_count % 50 == 0 {
+                                    error!("Ask failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Risk checks
+                if realized_pnl <= -config.risk.max_loss_quote {
+                    error!("💀 STOP LOSS at ${:.2}", realized_pnl);
+                    break;
+                }
+                if realized_pnl >= config.risk.max_profit_quote {
+                    info!("🎯 TAKE PROFIT at ${:.2}", realized_pnl);
+                    break;
+                }
+            }
+
+            // Log WS order latency every 30s
+            _ = latency_ticker.tick() => {
+                if let Some(ref ws_client) = ws_order_client {
+                    let client = ws_client.read().await;
+                    client.log_latency().await;
+                }
+            }
+
+            // Polling fallback
+            _ = poll_ticker.tick() => {
+                match rest_client.get_fills(&config.market.symbol, 10).await {
+                    Ok(fills) => {
+                        if !fills.is_empty() && fills.len() as u64 != last_poll_fills {
+                            let mgr = order_manager.read().await;
+                            let current_fills = mgr.stats().0;
+                            drop(mgr);
+                            
+                            if current_fills < fills.len() as u64 {
+                                warn!("[POLL] Detected {} fills via REST, WS has {}",
+                                    fills.len(), current_fills);
+                            }
+                        }
+                        last_poll_fills = fills.len() as u64;
+                    }
+                    Err(e) => {
+                        warn!("[POLL] Failed to get fills: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Shutdown
+    info!("");
+    info!("[SHUTDOWN] Cancelling all orders...");
+    match rest_client.cancel_all_orders(&config.market.symbol).await {
+        Ok(count) => info!("[SHUTDOWN] Cancelled {} orders", count),
+        Err(e) => warn!("[SHUTDOWN] Cancel failed: {}", e),
+    }
+
+    // Log final WS latency stats
+    if let Some(ref ws_client) = ws_order_client {
+        let client = ws_client.read().await;
+        client.log_latency().await;
+    }
+
+    let mgr = order_manager.read().await;
+    let (fills, vol_base, vol_quote) = mgr.stats();
+    let realized_pnl = mgr.realized_pnl();
+    let rebates = mgr.rebates();
+    drop(mgr);
+
+    info!("");
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("                    SESSION SUMMARY                            ");
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  Total Fills:    {}", fills);
+    info!("  Volume (base):  {:.4}", vol_base);
+    info!("  Volume (quote): ${:.2}", vol_quote);
+    info!("  Realized PnL:   ${:.4}", realized_pnl);
+    info!("  Rebates:        ${:.4}", rebates);
+    info!("═══════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
