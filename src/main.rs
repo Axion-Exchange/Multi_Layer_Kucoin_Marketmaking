@@ -16,16 +16,16 @@ use exchange::ws_order_client_v2::{WsOrderClientV2, WsOrderRequest, WsCancelRequ
 // CONFIGURATION - 25 LAYERS PER SIDE
 // ═══════════════════════════════════════════════════════════════════
 const LEVELS: [(f64, f64); 25] = [
-    // Close layers: tighter refresh (+20% vs original)
-    (0.55, 0.34), (1.23, 0.74), (1.91, 1.15), (2.59, 1.56), (3.27, 1.97),
-    (3.95, 2.38), (4.63, 2.78), (5.31, 3.19), (5.99, 3.60), (6.67, 4.01),
-    // Mid layers: moderate refresh (+20%)
-    (7.35, 4.8), (8.03, 5.4), (8.71, 6.0), (9.39, 6.6), (10.07, 7.2),
-    // Far layers: wider refresh (match spread - no change needed)
-    (10.75, 12.90), (11.43, 13.72), (12.11, 14.53), (12.79, 15.35), (13.47, 16.16),
-    (14.15, 16.98), (14.83, 17.80), (15.51, 18.61), (16.19, 19.43), (16.87, 20.24)
+    // Close layers: spreads +20%, refresh -30%
+    (0.66, 1.50), (1.48, 3.31), (2.29, 5.10), (3.11, 6.93), (3.92, 8.73),
+    (4.74, 10.54), (5.56, 12.33), (6.37, 14.16), (7.19, 15.95), (8.00, 17.77),
+    // Mid layers: spreads +20%, refresh -30%
+    (8.82, 21.3), (9.64, 23.9), (10.45, 26.8), (11.27, 29.3), (12.08, 32.0),
+    // Far layers: spreads +20%, refresh -30%
+    (12.90, 57.2), (13.72, 60.8), (14.53, 64.3), (15.35, 68.0), (16.16, 71.7),
+    (16.98, 75.1), (17.80, 78.9), (18.61, 82.5), (19.43, 86.0), (20.24, 89.8)
 ];
-const ORDER_USD: f64 = 10.0;
+const ORDER_USD: f64 = 25.0;
 const MAX_INV_SOL: f64 = 15.0;
 const REBATE: f64 = 1.0;
 const SYM: &str = "SOL-USDT";
@@ -743,10 +743,11 @@ async fn main() -> Result<()> {
                 let uptrend = momentum > MOMENTUM_THRESHOLD;
                 let inv = pnl.inv();
                 
-                // Downtrend: pause if not holding long (protect from falling knife)
+                // Downtrend: skip BIDS only (not asks) when not holding long
+                // V10.5b: Fixed - was using continue which skipped asks too!
                 if downtrend {
                     if !mom_paused { info!("[TREND] DOWN {:.2}% - selling only", momentum * 100.0); mom_paused = true; }
-                    if inv <= 0.05 { continue; }
+                    if inv <= 0.05 { skip_bids = true; }  // Only skip bids, let asks continue
                 } else if !uptrend && mom_paused { 
                     info!("[TREND] Normal"); 
                     mom_paused = false; 
