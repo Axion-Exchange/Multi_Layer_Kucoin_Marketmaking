@@ -270,7 +270,7 @@ async fn main() -> Result<()> {
     let auth4 = auth.clone();
     
     let ws = Arc::new(RwLock::new(WsOrderClientV2::new(
-        auth, "https://api.kucoin.com".into(), "wss://fgtyhceu.kucoin.com/v1/private".into()
+        auth, "https://api.kucoin.com".into(), "wss://wsapi.kucoin.com/v1/private".into()
     )));
     { ws.write().await.connect().await?; }
     info!("[WS] OK");
