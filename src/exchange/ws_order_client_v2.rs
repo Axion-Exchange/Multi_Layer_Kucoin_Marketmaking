@@ -740,7 +740,7 @@ impl WsOrderClientV2 {
         let msg = json!({
             "id": id,
             "op": "spot.cancel",
-            "args": [serde_json::Value::Object(args_obj)]
+            "args": serde_json::Value::Object(args_obj)
         });
         
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -748,6 +748,9 @@ impl WsOrderClientV2 {
             let mut pending = self.pending.write().await;
             pending.insert(id.clone(), PendingRequest { tx: resp_tx, sent_at: Instant::now() });
         }
+        
+        // DEBUG: Log the actual message being sent
+        info!("[WS-ORDER] Sending cancel: {}", msg.to_string());
         
         tx.send(msg.to_string()).await?;
         
