@@ -1,4 +1,4 @@
-//! TEST_Multi_layers v10.3: Institutional-Grade Order Management
+//! TEST_Multi_layers v10.5: Partial Fill Tracking + FIFO Persistence
 use anyhow::Result;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -38,9 +38,9 @@ const GAMMA: f64 = 0.1;
 const OFI_PAUSE_THRESHOLD: f64 = 0.60;
 const OFI_RESUME_THRESHOLD: f64 = 0.35;
 const VOL_EWMA_LAMBDA: f64 = 0.94;
-const SIGMA_FLOOR: f64 = 0.02;
+const SIGMA_FLOOR: f64 = 0.016;           // V10.5: Reduced 20% from 0.02
 const MOMENTUM_THRESHOLD: f64 = 0.003;
-const MOMENTUM_WINDOW_SECS: u64 = 300;
+const MOMENTUM_WINDOW_SECS: u64 = 180;    // V10.5: Reduced from 300s to 3min
 const ETA: f64 = -0.005;
 
 // V10.3: Cancel timeout - try REST fallback before forcing empty
@@ -58,7 +58,8 @@ const BALANCE_SAFETY_BUFFER_PCT: f64 = 0.02; // 2% buffer
 #[derive(Clone, Debug)]
 enum LevelOrderState {
     Empty,
-    Live { order_id: String, price: f64 },
+    // V10.5: Added remaining_size for partial fill tracking
+    Live { order_id: String, price: f64, remaining_size: f64 },
     CancelPending { order_id: String, price: f64, sent_at: Instant, attempts: u8 },
     // V10.3: Order stuck - WS cancel failed, needs REST fallback
     CancelStuck { order_id: String, price: f64 },
@@ -134,8 +135,15 @@ fn can_place_bid(inv: f64, size: f64) -> bool { inv + size <= MAX_INV_SOL }
 fn can_place_ask(inv: f64, size: f64) -> bool { inv - size >= -MAX_INV_SOL }
 fn needs_cancel_bid(inv: f64, size: f64, skip_bids: bool) -> bool { skip_bids || inv + size > MAX_INV_SOL }
 fn needs_cancel_ask(inv: f64, size: f64) -> bool { inv - size < -MAX_INV_SOL }
+// V10.5: FIFO state persistence path
+const FIFO_STATE_FILE: &str = "fifo_state.json";
+
+// V10.5: Serializable entry for FIFO persistence
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SerEntry { px: f64, sz: f64 }
 
 struct Entry { px: f64, sz: f64 }
+
 #[derive(Default)]
 struct PnL {
     lq: VecDeque<Entry>, sq: VecDeque<Entry>,
@@ -175,6 +183,55 @@ impl PnL {
         self.lq.iter().map(|e| e.sz).sum::<f64>() - self.sq.iter().map(|e| e.sz).sum::<f64>() 
     }
     fn net(&self) -> f64 { self.spread + self.reb }
+    
+    // V10.5: Save FIFO state to disk
+    fn save(&self) {
+        let lq: Vec<SerEntry> = self.lq.iter().map(|e| SerEntry { px: e.px, sz: e.sz }).collect();
+        let sq: Vec<SerEntry> = self.sq.iter().map(|e| SerEntry { px: e.px, sz: e.sz }).collect();
+        let state = serde_json::json!({
+            "lq": lq, "sq": sq,
+            "buys": self.buys, "sells": self.sells,
+            "spread": self.spread, "reb": self.reb,
+            "matched": self.matched, "wins": self.wins, "losses": self.losses
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(FIFO_STATE_FILE, json);
+        }
+    }
+    
+    // V10.5: Load FIFO state from disk
+    fn load() -> Self {
+        if let Ok(data) = std::fs::read_to_string(FIFO_STATE_FILE) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                let lq: VecDeque<Entry> = v["lq"].as_array()
+                    .map(|arr| arr.iter().filter_map(|e| {
+                        Some(Entry { px: e["px"].as_f64()?, sz: e["sz"].as_f64()? })
+                    }).collect())
+                    .unwrap_or_default();
+                let sq: VecDeque<Entry> = v["sq"].as_array()
+                    .map(|arr| arr.iter().filter_map(|e| {
+                        Some(Entry { px: e["px"].as_f64()?, sz: e["sz"].as_f64()? })
+                    }).collect())
+                    .unwrap_or_default();
+                
+                let pnl = PnL {
+                    lq, sq,
+                    buys: v["buys"].as_u64().unwrap_or(0),
+                    sells: v["sells"].as_u64().unwrap_or(0),
+                    spread: v["spread"].as_f64().unwrap_or(0.0),
+                    reb: v["reb"].as_f64().unwrap_or(0.0),
+                    matched: v["matched"].as_u64().unwrap_or(0),
+                    wins: v["wins"].as_u64().unwrap_or(0),
+                    losses: v["losses"].as_u64().unwrap_or(0),
+                };
+                info!("[FIFO] Loaded state: inv={:.3} SOL, spread=${:.4}, reb=${:.4}", 
+                    pnl.inv(), pnl.spread, pnl.reb);
+                return pnl;
+            }
+        }
+        info!("[FIFO] No saved state found, starting fresh");
+        PnL::default()
+    }
 }
 
 #[derive(Default)]
@@ -380,7 +437,7 @@ async fn rest_cancel_order(auth: &KucoinAuth, order_id: &str) -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_target(false).init();
-    info!("═══ V10.3: Institutional-Grade Order Management ═══");
+    info!("═══ V10.5: Partial Fill Tracking + FIFO Persistence ═══");
     
     let auth = KucoinAuth::new(
         std::env::var("KUCOIN_API_KEY")?, std::env::var("KUCOIN_API_SECRET")?,
@@ -433,7 +490,8 @@ async fn main() -> Result<()> {
         level_orders.insert((*bps * 10.0) as i32, (LevelOrderState::Empty, LevelOrderState::Empty));
     }
     
-    let mut pnl = PnL::default();
+    // V10.5: Load FIFO state from disk (persistence across restarts)
+    let mut pnl = PnL::load();
     let mut seen: HashSet<String> = HashSet::new();
     let start = Instant::now();
     
@@ -483,6 +541,10 @@ async fn main() -> Result<()> {
                 info!("SPREAD: ${:.4} | REBATE: ${:.4} | NET: ${:.4}", pnl.spread, pnl.reb, pnl.net());
                 info!("═══════════════════════════════════════════════════════════════");
                 
+                // V10.5: Save FIFO state for next restart
+                pnl.save();
+                info!("[SHUTDOWN] FIFO state saved to disk");
+                
                 break;
             }
             _ = recon.tick(), if !shutting_down => {
@@ -507,14 +569,22 @@ async fn main() -> Result<()> {
                 for (_, (bid_state, ask_state)) in level_orders.iter_mut() {
                     // Handle bid state
                     match bid_state {
-                        LevelOrderState::Live { order_id, price } => {
+                        LevelOrderState::Live { order_id, price, remaining_size } => {
                             if !active_ids.contains(order_id) {
                                 // Order filled or cancelled externally
                                 *bid_state = LevelOrderState::Empty;
                             } else {
                                 tracked_ids.insert(order_id.clone());
-                                // Recalculate live commitment from actual order
+                                // V10.5: Update remaining size from exchange and recalc commitment
                                 if let Some(o) = orders.iter().find(|o| &o.order_id == order_id) {
+                                    // Update remaining_size if partial fill occurred
+                                    if (o.size - *remaining_size).abs() > 0.001 {
+                                        *bid_state = LevelOrderState::Live { 
+                                            order_id: order_id.clone(), 
+                                            price: *price, 
+                                            remaining_size: o.size 
+                                        };
+                                    }
                                     commitments.live_usdt += o.size * o.price;
                                 }
                             }
@@ -557,12 +627,20 @@ async fn main() -> Result<()> {
                     
                     // Handle ask state
                     match ask_state {
-                        LevelOrderState::Live { order_id, price } => {
+                        LevelOrderState::Live { order_id, price, remaining_size } => {
                             if !active_ids.contains(order_id) {
                                 *ask_state = LevelOrderState::Empty;
                             } else {
                                 tracked_ids.insert(order_id.clone());
+                                // V10.5: Update remaining size from exchange
                                 if let Some(o) = orders.iter().find(|o| &o.order_id == order_id) {
+                                    if (o.size - *remaining_size).abs() > 0.001 {
+                                        *ask_state = LevelOrderState::Live { 
+                                            order_id: order_id.clone(), 
+                                            price: *price, 
+                                            remaining_size: o.size 
+                                        };
+                                    }
                                     commitments.live_sol += o.size;
                                 }
                             }
@@ -708,7 +786,7 @@ async fn main() -> Result<()> {
                     
                     // ═══ REFRESH CHECK: Cancel stale orders beyond threshold ═══
                     // V10: Only transition to CancelPending, don't clear immediately
-                    if let LevelOrderState::Live { ref order_id, price } = bid_state {
+                    if let LevelOrderState::Live { ref order_id, price, .. } = bid_state {
                         let bps_diff = ((price - bp).abs() / bp) * 10000.0;
                         if bps_diff > *thresh {
                             if let Ok(r) = ws.cancel_order(WsCancelRequest {
@@ -729,7 +807,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     
-                    if let LevelOrderState::Live { ref order_id, price } = ask_state {
+                    if let LevelOrderState::Live { ref order_id, price, .. } = ask_state {
                         let bps_diff = ((price - ap).abs() / ap) * 10000.0;
                         if bps_diff > *thresh {
                             if let Ok(r) = ws.cancel_order(WsCancelRequest {
@@ -768,15 +846,15 @@ async fn main() -> Result<()> {
                             if r.success {
                                 if let Some(ref oid) = r.order_id {
                                     level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
-                                        LevelOrderState::Live { order_id: oid.clone(), price: bp };
-                                    // V10.3: Track inflight commitment
+                                        LevelOrderState::Live { order_id: oid.clone(), price: bp, remaining_size: bid_sz };
+                                    // V10.5: Track inflight commitment (don't reset until confirmed)
                                     commitments.add_inflight_bid(bid_sz * bp);
                                 }
                             }
                         }
                     } else if bid_state.is_live() && needs_cancel_bid(inv, bid_sz, skip_bids) {
                         // Cancel bid due to skip or inventory
-                        if let LevelOrderState::Live { ref order_id, price } = bid_state {
+                        if let LevelOrderState::Live { ref order_id, price, .. } = bid_state {
                             if let Ok(r) = ws.cancel_order(WsCancelRequest {
                                 symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
                             }).await {
@@ -805,14 +883,15 @@ async fn main() -> Result<()> {
                             if r.success {
                                 if let Some(ref oid) = r.order_id {
                                     level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
-                                        LevelOrderState::Live { order_id: oid.clone(), price: ap };
+                                        LevelOrderState::Live { order_id: oid.clone(), price: ap, remaining_size: ask_sz };
+                                    // V10.5: Track inflight commitment (don't reset until confirmed)
                                     // V10.3: Track inflight commitment
                                     commitments.add_inflight_ask(ask_sz);
                                 }
                             }
                         }
                     } else if ask_state.is_live() && needs_cancel_ask(inv, ask_sz) {
-                        if let LevelOrderState::Live { ref order_id, price } = ask_state {
+                        if let LevelOrderState::Live { ref order_id, price, .. } = ask_state {
                             if let Ok(r) = ws.cancel_order(WsCancelRequest {
                                 symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
                             }).await {
@@ -855,6 +934,9 @@ async fn main() -> Result<()> {
                     bal.sol, bal.usdt, skew, update_interval);
                 info!("SPREAD: ${:.4} | REBATE: ${:.4} | NET: ${:.4}", pnl.spread, pnl.reb, pnl.net());
                 info!("═══════════════════════════════════════════════════════════════");
+                
+                // V10.5: Periodic FIFO save (every 30s log tick)
+                pnl.save();
             }
         }
     }
