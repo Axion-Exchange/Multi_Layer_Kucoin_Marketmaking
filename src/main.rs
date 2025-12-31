@@ -956,15 +956,12 @@ async fn main() -> Result<()> {
                     } else if bid_state.is_live() && needs_cancel_bid(inv, bid_sz, skip_bids) {
                         // Cancel bid due to skip or inventory
                         if let LevelOrderState::Live { ref order_id, price, .. } = bid_state {
-                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                            // V10.13c: Always use CancelPending - don't trust WS success alone
+                            if let Ok(_r) = ws.cancel_order(WsCancelRequest {
                                 symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
                             }).await {
-                                if r.success {
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = LevelOrderState::Empty;
-                                } else {
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
-                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
-                                }
+                                level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
+                                    LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
                             }
                         }
                     }
@@ -995,15 +992,12 @@ async fn main() -> Result<()> {
                         }
                     } else if ask_state.is_live() && needs_cancel_ask(inv, ask_sz) {
                         if let LevelOrderState::Live { ref order_id, price, .. } = ask_state {
-                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                            // V10.13c: Always use CancelPending - don't trust WS success alone
+                            if let Ok(_r) = ws.cancel_order(WsCancelRequest {
                                 symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
                             }).await {
-                                if r.success {
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = LevelOrderState::Empty;
-                                } else {
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
-                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
-                                }
+                                level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
+                                    LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
                             }
                         }
                     }
