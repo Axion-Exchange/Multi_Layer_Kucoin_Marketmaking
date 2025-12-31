@@ -16,14 +16,16 @@ use exchange::ws_order_client_v2::{WsOrderClientV2, WsOrderRequest, WsCancelRequ
 // CONFIGURATION - 25 LAYERS PER SIDE
 // ═══════════════════════════════════════════════════════════════════
 const LEVELS: [(f64, f64); 25] = [
-    // Close layers: spreads +20%, refresh -30%
-    (0.66, 1.50), (1.48, 3.31), (2.29, 5.10), (3.11, 6.93), (3.92, 8.73),
-    (4.74, 10.54), (5.56, 12.33), (6.37, 14.16), (7.19, 15.95), (8.00, 17.77),
-    // Mid layers: spreads +20%, refresh -30%
-    (8.82, 21.3), (9.64, 23.9), (10.45, 26.8), (11.27, 29.3), (12.08, 32.0),
-    // Far layers: spreads +20%, refresh -30%
-    (12.90, 57.2), (13.72, 60.8), (14.53, 64.3), (15.35, 68.0), (16.16, 71.7),
-    (16.98, 75.1), (17.80, 78.9), (18.61, 82.5), (19.43, 86.0), (20.24, 89.8)
+    // V10.10: L1=0.25, L2-L6 +0.5bps gaps, L7-L25 +1bps gaps
+    // Close layers (0.5 bps increments after L1)
+    (0.25, 1.92), (0.75, 4.24), (1.25, 6.52), (1.75, 8.86), (2.25, 11.16),
+    (2.75, 13.48),
+    // Mid layers (1.0 bps increments)
+    (3.75, 15.78), (4.75, 18.12), (5.75, 20.42), (6.75, 22.76),
+    (7.75, 27.2), (8.75, 30.6), (9.75, 34.2), (10.75, 37.4), (11.75, 41.0),
+    // Far layers (1.0 bps increments)
+    (12.75, 73.2), (13.75, 77.8), (14.75, 82.2), (15.75, 87.0), (16.75, 91.8),
+    (17.75, 96.2), (18.75, 101.0), (19.75, 105.6), (20.75, 110.2), (21.75, 114.8)
 ];
 const ORDER_USD: f64 = 25.0;
 const MAX_INV_SOL: f64 = 15.0;
@@ -34,14 +36,16 @@ const MAX_ORDERS_PER_SIDE: usize = 25; // 25 bids + 25 asks
 // ═══════════════════════════════════════════════════════════════════
 // QUANT PARAMETERS
 // ═══════════════════════════════════════════════════════════════════
-const GAMMA: f64 = 0.1;
-const OFI_PAUSE_THRESHOLD: f64 = 0.60;
+const GAMMA: f64 = 0.05;
+const OFI_PAUSE_THRESHOLD: f64 = 0.70;
 const OFI_RESUME_THRESHOLD: f64 = 0.35;
 const VOL_EWMA_LAMBDA: f64 = 0.94;
 const SIGMA_FLOOR: f64 = 0.016;           // V10.5: Reduced 20% from 0.02
 const MOMENTUM_THRESHOLD: f64 = 0.003;
 const MOMENTUM_WINDOW_SECS: u64 = 180;    // V10.5: Reduced from 300s to 3min
 const ETA: f64 = -0.005;
+const STRONG_OFI_CANCEL: f64 = 0.75;      // V10.13: Cancel existing orders on strong OFI
+const INV_NEUTRAL_ZONE: f64 = 2.0;        // V10.13: Inventory zone considered "neutral"
 
 // V10.3: Cancel timeout - try REST fallback before forcing empty
 const CANCEL_TIMEOUT_SECS: u64 = 5;
@@ -462,8 +466,15 @@ async fn rest_cancel_order(auth: &KucoinAuth, order_id: &str) -> bool {
         .header("KC-API-KEY", auth.api_key()).header("KC-API-SIGN", &sig)
         .header("KC-API-TIMESTAMP", &ts).header("KC-API-PASSPHRASE", &pw)
         .header("KC-API-KEY-VERSION", &ver).send().await {
-        return r.status().is_success();
+        if r.status().is_success() {
+            info!("[REST-CANCEL] Success: {}", order_id);
+            return true;
+        } else {
+            warn!("[REST-CANCEL] Failed {}: HTTP {}", order_id, r.status());
+            return false;
+        }
     }
+    warn!("[REST-CANCEL] Request error for {}", order_id);
     false
 }
 
@@ -754,6 +765,8 @@ async fn main() -> Result<()> {
                 let md = data.read().await;
                 // V10.5c: Use weighted fair mid (0.8 Binance + 0.2 KuCoin)
                 let m = md.fair_mid();
+                let binance_mid = md.mid;  // V10.11: For refresh check
+                let kucoin_mid = md.kucoin_mid;  // V10.9: For BBO safety check
                 let ofi = md.ofi;
                 let sigma = md.sigma();
                 let momentum = md.momentum();
@@ -801,6 +814,19 @@ async fn main() -> Result<()> {
                 
                 skip_bids = skip_bids || downtrend;
                 
+                // ═══ V10.13: Inventory-Aware Trend Protection ═══
+                // Cancel existing orders that would INCREASE adverse position
+                // BUT keep orders that REDUCE inventory toward neutral
+                let strong_up = ofi > STRONG_OFI_CANCEL;    // Strong uptrend
+                let strong_down = ofi < -STRONG_OFI_CANCEL; // Strong downtrend
+                let inv_long = inv > INV_NEUTRAL_ZONE;      // Holding long position
+                let inv_short = inv < -INV_NEUTRAL_ZONE;    // Holding short position
+                
+                // Cancel bids during strong downtrend, UNLESS we're short (want to cover)
+                let cancel_adverse_bids = strong_down && !inv_short;
+                // Cancel asks during strong uptrend, UNLESS we're long (want to unload)
+                let cancel_adverse_asks = strong_up && !inv_long;
+                
                 // ═══ QUANT 3: Inventory Skew ═══
                 let skew_bps = inv * GAMMA * sigma * sigma * 10000.0;
                 
@@ -820,49 +846,83 @@ async fn main() -> Result<()> {
                     let capped_skew = skew_bps.clamp(-max_skew, max_skew);
                     let bid_bps = bps + capped_skew;
                     // Apply uptrend multiplier to asks (widen during rallies)
-                    let ask_bps = (bps - capped_skew) * uptrend_multiplier;
+                    let ask_bps = bps - capped_skew;  // V10.6: Removed uptrend_multiplier to prevent instant cancel bug
                     
                     let bp = ((m * (1.0 - bid_bps / 10000.0)) / 0.01).round() * 0.01;
                     let ap = ((m * (1.0 + ask_bps / 10000.0)) / 0.01).round() * 0.01;
                     
+                    // V10.11: Use Binance mid for refresh target (faster signal)
+                    let refresh_bp = ((binance_mid * (1.0 - bid_bps / 10000.0)) / 0.01).round() * 0.01;
+                    let refresh_ap = ((binance_mid * (1.0 + ask_bps / 10000.0)) / 0.01).round() * 0.01;
+                    
                     // ═══ REFRESH CHECK: Cancel stale orders beyond threshold ═══
-                    // V10: Only transition to CancelPending, don't clear immediately
-                    if let LevelOrderState::Live { ref order_id, price, .. } = bid_state {
-                        let bps_diff = ((price - bp).abs() / bp) * 10000.0;
-                        if bps_diff > *thresh {
-                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                    // V10.6: Aggressive cancel for ALL order states when severely stale
+                    let bid_order_id = match &bid_state {
+                        LevelOrderState::Live { order_id, price, .. } => Some((order_id.clone(), *price)),
+                        LevelOrderState::CancelPending { order_id, price, .. } => Some((order_id.clone(), *price)),
+                        LevelOrderState::CancelStuck { order_id, price } => Some((order_id.clone(), *price)),
+                        LevelOrderState::Empty => None,
+                    };
+                    
+                    if let Some((order_id, price)) = bid_order_id {
+                        // V10.11: Compare against Binance-based refresh target
+                        let bps_diff = ((price - refresh_bp).abs() / refresh_bp) * 10000.0;
+                        let severely_stale = bps_diff > thresh * 2.0;  // 2x threshold = emergency
+                        
+                        if bps_diff > *thresh || cancel_adverse_bids {
+                            // V10.13: Log if canceling due to adverse trend protection
+                            if cancel_adverse_bids && bps_diff <= *thresh {
+                                warn!("[TREND-PROTECT] Canceling bid {} due to strong downtrend (OFI:{:.2})", order_id, ofi);
+                            }
+                            // V10.12: Always transition to CancelPending - don't trust WS success alone
+                            // Recon loop will confirm actual cancellation via active_ids check
+                            if let Ok(_r) = ws.cancel_order(WsCancelRequest {
                                 symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
                             }).await {
-                                if r.success {
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = LevelOrderState::Empty;
-                                } else {
-                                    // Cancel sent but not confirmed - transition to CancelPending
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
-                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
-                                }
-                            } else {
-                                // WS error - still transition to CancelPending
+                                // WS cancel sent - transition to CancelPending regardless of r.success
+                                // Recon will confirm when order disappears from active_ids
                                 level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).0 = 
                                     LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
+                            }
+                            
+                            // V10.12: For severely stale, also fire REST cancel as backup
+                            if severely_stale {
+                                warn!("[STALE] Bid {} is {}bps off, firing REST cancel backup", order_id, bps_diff as i32);
+                                let _ = rest_cancel_order(&auth4, &order_id).await;
                             }
                         }
                     }
                     
-                    if let LevelOrderState::Live { ref order_id, price, .. } = ask_state {
-                        let bps_diff = ((price - ap).abs() / ap) * 10000.0;
-                        if bps_diff > *thresh {
-                            if let Ok(r) = ws.cancel_order(WsCancelRequest {
+                    let ask_order_id = match &ask_state {
+                        LevelOrderState::Live { order_id, price, .. } => Some((order_id.clone(), *price)),
+                        LevelOrderState::CancelPending { order_id, price, .. } => Some((order_id.clone(), *price)),
+                        LevelOrderState::CancelStuck { order_id, price } => Some((order_id.clone(), *price)),
+                        LevelOrderState::Empty => None,
+                    };
+                    
+                    if let Some((order_id, price)) = ask_order_id {
+                        // V10.11: Compare against Binance-based refresh target
+                        let bps_diff = ((price - refresh_ap).abs() / refresh_ap) * 10000.0;
+                        let severely_stale = bps_diff > thresh * 2.0;
+                        
+                        if bps_diff > *thresh || cancel_adverse_asks {
+                            // V10.13: Log if canceling due to adverse trend protection
+                            if cancel_adverse_asks && bps_diff <= *thresh {
+                                warn!("[TREND-PROTECT] Canceling ask {} due to strong uptrend (OFI:{:.2})", order_id, ofi);
+                            }
+                            // V10.12: Always transition to CancelPending - don't trust WS success alone
+                            if let Ok(_r) = ws.cancel_order(WsCancelRequest {
                                 symbol: SYM.into(), order_id: Some(order_id.clone()), client_oid: None
                             }).await {
-                                if r.success {
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = LevelOrderState::Empty;
-                                } else {
-                                    level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
-                                        LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
-                                }
-                            } else {
+                                // WS cancel sent - transition to CancelPending regardless of r.success
                                 level_orders.entry(key).or_insert((LevelOrderState::Empty, LevelOrderState::Empty)).1 = 
                                     LevelOrderState::CancelPending { order_id: order_id.clone(), price, sent_at: Instant::now(), attempts: 1 };
+                            }
+                            
+                            // V10.12: For severely stale, also fire REST cancel as backup
+                            if severely_stale {
+                                warn!("[STALE] Ask {} is {}bps off, firing REST cancel backup", order_id, bps_diff as i32);
+                                let _ = rest_cancel_order(&auth4, &order_id).await;
                             }
                         }
                     }
@@ -912,8 +972,10 @@ async fn main() -> Result<()> {
                     // ═══ ASK ORDER ═══
                     let sol_safety_buffer = bal.sol * BALANCE_SAFETY_BUFFER_PCT;
                     let available_sol = bal.sol - commitments.total_sol() - sol_safety_buffer;
+                    // V10.9: BBO safety - don't place asks below KuCoin mid (would cross spread)
+                    let ask_safe = ap > kucoin_mid || kucoin_mid <= 0.0;
                     if ask_state.is_empty() && !skip_asks && can_place_ask(inv, ask_sz)
-                        && available_sol >= ask_sz && local_ask_count < MAX_ORDERS_PER_SIDE {
+                        && available_sol >= ask_sz && local_ask_count < MAX_ORDERS_PER_SIDE && ask_safe {
                         if let Ok(r) = ws.place_order(WsOrderRequest {
                             symbol: SYM.into(), side: "sell".into(),
                             price: format!("{:.2}", ap), size: format!("{:.2}", ask_sz),
